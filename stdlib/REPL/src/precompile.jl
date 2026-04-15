@@ -17,7 +17,7 @@ end
 function repl_workload()
     # these are intentionally triggered
     allowed_errors = [
-        "BoundsError: attempt to access 0-element Vector{Any} at index [1]",
+        "BoundsError: attempt to access 0-element",
         "MethodError: no method matching f(::$Int, ::$Int)",
         "Padding of type", # reinterpret docstring has ERROR examples
     ]

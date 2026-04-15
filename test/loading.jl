@@ -275,7 +275,7 @@ end
         pkg = recurse_package(n...)
         @test pkg == PkgId(UUID(uuid), n[end])
         @test joinpath(@__DIR__, normpath(path)) == locate_package(pkg)
-        @test Base.compilecache_path(pkg, UInt64(0)) == Base.compilecache_path(pkg, UInt64(0))
+        @test Base.compilecache_path(pkg, "") == Base.compilecache_path(pkg, "")
     end
     @test identify_package("Baz") === nothing
     @test identify_package("Qux") === nothing
@@ -1105,6 +1105,190 @@ end
     end
 end
 
+@testset "Preferences blob" begin
+    # Tests for get_preferences_blob() and stale_prefs() - the serialization of
+    # compile-time preference observations into a TOML blob embedded in cache files.
+    pkg_uuid = uuid4()
+    pkg2_uuid = uuid4()
+    mktempdir() do dir
+        # Set up a project with preferences for two packages
+        write(joinpath(dir, "Project.toml"), """
+        [deps]
+        PkgA = "$(pkg_uuid)"
+        PkgB = "$(pkg2_uuid)"
+
+        [preferences.PkgA]
+        key1 = "val1"
+        key2 = 42
+
+        [preferences.PkgB]
+        flag = true
+        """)
+
+        old_load_path = copy(LOAD_PATH)
+        old_compiletime_prefs = Dict(k => copy(v) for (k, v) in Base.COMPILETIME_PREFERENCES)
+        try
+            copy!(LOAD_PATH, [joinpath(dir, "Project.toml")])
+            empty!(Base.COMPILETIME_PREFERENCES)
+
+            # Empty COMPILETIME_PREFERENCES → empty blob (fast-path)
+            @test Base.get_preferences_blob() == ""
+
+            # A queried+set preference appears in the main table
+            Base.record_compiletime_preference(pkg_uuid, "key1")
+            blob = Base.get_preferences_blob()
+            @test !isempty(blob)
+            parsed = Base.TOML.parse(Base.TOML.Parser{nothing}(blob))
+            @test parsed[string(pkg_uuid)]["key1"] == "val1"
+            @test !haskey(parsed, "unset")
+
+            # A queried+unset preference appears in the [unset] table
+            empty!(Base.COMPILETIME_PREFERENCES)
+            Base.record_compiletime_preference(pkg_uuid, "missing_key")
+            blob = Base.get_preferences_blob()
+            parsed = Base.TOML.parse(Base.TOML.Parser{nothing}(blob))
+            @test haskey(parsed, "unset")
+            @test "missing_key" in parsed["unset"][string(pkg_uuid)]
+            @test !haskey(get(parsed, string(pkg_uuid), Dict()), "missing_key")
+
+            # Mix of set and unset preferences for the same UUID
+            empty!(Base.COMPILETIME_PREFERENCES)
+            Base.record_compiletime_preference(pkg_uuid, "key1")
+            Base.record_compiletime_preference(pkg_uuid, "missing_key")
+            blob = Base.get_preferences_blob()
+            parsed = Base.TOML.parse(Base.TOML.Parser{nothing}(blob))
+            @test parsed[string(pkg_uuid)]["key1"] == "val1"
+            @test "missing_key" in parsed["unset"][string(pkg_uuid)]
+
+            # Multiple UUIDs are tracked independently
+            empty!(Base.COMPILETIME_PREFERENCES)
+            Base.record_compiletime_preference(pkg_uuid, "key1")
+            Base.record_compiletime_preference(pkg2_uuid, "flag")
+            blob = Base.get_preferences_blob()
+            parsed = Base.TOML.parse(Base.TOML.Parser{nothing}(blob))
+            @test parsed[string(pkg_uuid)]["key1"] == "val1"
+            @test parsed[string(pkg2_uuid)]["flag"] == true
+
+            # stale_prefs: empty blob is never stale
+            @test !Base.stale_prefs("")
+
+            # stale_prefs: set preference unchanged → not stale
+            empty!(Base.COMPILETIME_PREFERENCES)
+            Base.record_compiletime_preference(pkg_uuid, "key1")
+            blob = Base.get_preferences_blob()
+            @test !Base.stale_prefs(blob)
+
+            # stale_prefs: set preference value changed → stale
+            mktempdir() do dir2
+                write(joinpath(dir2, "Project.toml"), """
+                [deps]
+                PkgA = "$(pkg_uuid)"
+
+                [preferences.PkgA]
+                key1 = "different"
+                """)
+                copy!(LOAD_PATH, [joinpath(dir2, "Project.toml")])
+                @test Base.stale_prefs(blob)
+                copy!(LOAD_PATH, [joinpath(dir, "Project.toml")])
+            end
+
+            # stale_prefs: set preference becomes unset → stale
+            mktempdir() do dir2
+                write(joinpath(dir2, "Project.toml"), """
+                [deps]
+                PkgA = "$(pkg_uuid)"
+                """)
+                copy!(LOAD_PATH, [joinpath(dir2, "Project.toml")])
+                @test Base.stale_prefs(blob)
+                copy!(LOAD_PATH, [joinpath(dir, "Project.toml")])
+            end
+
+            # stale_prefs: unset preference still unset → not stale
+            empty!(Base.COMPILETIME_PREFERENCES)
+            Base.record_compiletime_preference(pkg_uuid, "missing_key")
+            blob_unset = Base.get_preferences_blob()
+            @test !Base.stale_prefs(blob_unset)
+
+            # stale_prefs: unset preference becomes set → stale
+            mktempdir() do dir2
+                write(joinpath(dir2, "Project.toml"), """
+                [deps]
+                PkgA = "$(pkg_uuid)"
+
+                [preferences.PkgA]
+                missing_key = "now_set"
+                """)
+                copy!(LOAD_PATH, [joinpath(dir2, "Project.toml")])
+                @test Base.stale_prefs(blob_unset)
+                copy!(LOAD_PATH, [joinpath(dir, "Project.toml")])
+            end
+
+            # hash collision test:
+            #   https://github.com/JuliaLang/julia/issues/59345#issue-3338450603
+            #
+            # `1`, `1.0`, and `true` are all `isequal` in Julia, so == / isequal / hash
+            # cannot distinguish these semantically distinct values, but the preferences
+            # system should distinguish them since they are clearly different objects
+            mktempdir() do dir_bool
+                write(joinpath(dir_bool, "Project.toml"), """
+                [deps]
+                PkgA = "$(pkg_uuid)"
+
+                [preferences.PkgA]
+                flag = true
+                """)
+                copy!(LOAD_PATH, [joinpath(dir_bool, "Project.toml")])
+                empty!(Base.COMPILETIME_PREFERENCES)
+                Base.record_compiletime_preference(pkg_uuid, "flag")
+                blob_bool = Base.get_preferences_blob()
+
+                mktempdir() do dir_int
+                    write(joinpath(dir_int, "Project.toml"), """
+                    [deps]
+                    PkgA = "$(pkg_uuid)"
+
+                    [preferences.PkgA]
+                    flag = 1
+                    """)
+                    copy!(LOAD_PATH, [joinpath(dir_int, "Project.toml")])
+                    @test Base.stale_prefs(blob_bool)
+                end
+                copy!(LOAD_PATH, [joinpath(dir, "Project.toml")])
+            end
+
+            # hash collision test (on ≥1.13, where hash(false, UInt(0)) == UInt(0))
+            #
+            # the old hash-based approach for preference invalidation would fail to detect
+            # the difference between `pref = false` and "no preference".
+            mktempdir() do dir2
+                write(joinpath(dir2, "Project.toml"), """
+                [deps]
+                PkgA = "$(pkg_uuid)"
+
+                [preferences.PkgA]
+                key1 = false
+                """)
+                copy!(LOAD_PATH, [joinpath(dir2, "Project.toml")])
+                empty!(Base.COMPILETIME_PREFERENCES)
+                Base.record_compiletime_preference(pkg_uuid, "key1")
+                blob_false = Base.get_preferences_blob()
+                mktempdir() do dir3
+                    write(joinpath(dir3, "Project.toml"), """
+                    [deps]
+                    PkgA = "$(pkg_uuid)"
+                    """)
+                    copy!(LOAD_PATH, [joinpath(dir3, "Project.toml")])
+                    @test Base.stale_prefs(blob_false)
+                end
+                copy!(LOAD_PATH, [joinpath(dir, "Project.toml")])
+            end
+        finally
+            copy!(LOAD_PATH, old_load_path)
+            empty!(Base.COMPILETIME_PREFERENCES)
+            merge!(Base.COMPILETIME_PREFERENCES, old_compiletime_prefs)
+        end
+    end
+end
 
 @testset "Loading with incomplete manifest/depot #45977" begin
     mktempdir() do tmp
@@ -1515,10 +1699,8 @@ end
             """)
         write(joinpath(foo_path, "Manifest.toml"),
             """
-            # This file is machine-generated - editing it directly is not advised
-            julia_version = "1.13.0-DEV"
+            julia_version = "1.13.0"
             manifest_format = "2.0"
-            project_hash = "8699765aeeac181c3e5ddbaeb9371968e1f84d6b"
 
             [[deps.Foo51989]]
             path = "."
@@ -1578,15 +1760,6 @@ end
         @test success(addenv(
             `$(Base.julia_cmd()) --project=$badmanifest_test_dir2 --startup-file=no -e 'using LibGit2'`,
             "JULIA_DEPOT_PATH" => string(depot * Base.Filesystem.pathsep(), s),
-        ))
-    end
-    mktempdir() do depot
-        # This manifest has a LibGit2 entry that has a LibGit2_jll with a git-tree-hash1
-        # which simulates an old manifest where LibGit2_jll was not a stdlib
-        badmanifest_test_dir2 = joinpath(@__DIR__, "project", "deps", "BadStdlibDeps2")
-        @test success(addenv(
-            `$(Base.julia_cmd()) --project=$badmanifest_test_dir2 --startup-file=no -e 'using LibGit2'`,
-            "JULIA_DEPOT_PATH" => depot * Base.Filesystem.pathsep(),
         ))
     end
 end

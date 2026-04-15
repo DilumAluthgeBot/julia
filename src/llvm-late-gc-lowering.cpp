@@ -1148,44 +1148,44 @@ void LateLowerGCFrame::FixUpRefinements(ArrayRef<int> PHINumbers, State &S)
     }
 }
 
-// Look through instructions to find all possible allocas that might become the sret argument
-static std::optional<SmallSetVector<AllocaInst *, 8>> FindSretAllocas(Value* SRetArg) {
-    SmallSetVector<AllocaInst *, 8> allocas;
-    if (AllocaInst *OneSRet = dyn_cast<AllocaInst>(SRetArg)) {
-        allocas.insert(OneSRet); // Found it directly
-    } else {
-        SmallSetVector<Value *, 8> worklist;
-        worklist.insert(SRetArg);
+// Look through selects and phis to find all possible alloca bases of a pointer.
+// Returns an empty set if a non-alloca base is encountered.
+static SmallSetVector<AllocaInst *, 1> FindAllocaBases(Value *V) {
+    SmallSetVector<AllocaInst *, 1> allocas;
+    if (AllocaInst *AI = dyn_cast<AllocaInst>(V)) {
+        allocas.insert(AI); // Found it directly
+    }
+    else {
+        SmallVector<Value *, 8> worklist;
+        SmallPtrSet<Value *, 8> visited;
+        worklist.push_back(V);
+        visited.insert(V);
         while (!worklist.empty()) {
-            Value *V = worklist.pop_back_val();
-            if (AllocaInst *Alloca = dyn_cast<AllocaInst>(V->stripInBoundsOffsets())) {
+            Value *W = worklist.pop_back_val();
+            if (AllocaInst *Alloca = dyn_cast<AllocaInst>(W->stripInBoundsOffsets())) {
                 allocas.insert(Alloca); // Found a candidate
-            } else if (PHINode *Phi = dyn_cast<PHINode>(V)) {
+            }
+            else if (PHINode *Phi = dyn_cast<PHINode>(W)) {
                 for (Value *Incoming : Phi->incoming_values()) {
-                    worklist.insert(Incoming);
+                    if (visited.insert(Incoming).second)
+                        worklist.push_back(Incoming);
                 }
-            } else if (SelectInst *SI = dyn_cast<SelectInst>(V)) {
-                auto TrueBranch = SI->getTrueValue();
-                auto FalseBranch = SI->getFalseValue();
-                if (TrueBranch && FalseBranch) {
-                    worklist.insert(TrueBranch);
-                    worklist.insert(FalseBranch);
-                } else {
-                    llvm_dump(SI);
-                    dbgs() << "Malformed Select\n";
-                    return {};
-                }
-            } else {
-                llvm_dump(V);
-                dbgs() << "Unexpected SRet argument\n";
-                return {};
+            }
+            else if (SelectInst *SI = dyn_cast<SelectInst>(W)) {
+                if (visited.insert(SI->getTrueValue()).second)
+                    worklist.push_back(SI->getTrueValue());
+                if (visited.insert(SI->getFalseValue()).second)
+                    worklist.push_back(SI->getFalseValue());
+            }
+            else {
+                allocas.clear();
+                return allocas;
             }
         }
     }
-    assert(allocas.size() > 0);
-    assert(std::all_of(allocas.begin(), allocas.end(), [&] (AllocaInst* SRetAlloca) JL_NOTSAFEPOINT {
-            return (SRetAlloca->getArraySize() == allocas[0]->getArraySize() &&
-            SRetAlloca->getAllocatedType() == allocas[0]->getAllocatedType());
+    assert(std::all_of(allocas.begin(), allocas.end(), [&] (AllocaInst *AI) JL_NOTSAFEPOINT {
+            return (AI->getArraySize() == allocas[0]->getArraySize() &&
+                AI->getAllocatedType() == allocas[0]->getAllocatedType());
         }
     ));
     return allocas;
@@ -1250,15 +1250,14 @@ State LateLowerGCFrame::LocalScan(Function &F) {
                     auto tracked = CountTrackedPointers(ElT, true);
                     if (tracked.count) {
                         HasDefBefore = true;
-                        auto allocas_opt = FindSretAllocas((CI->arg_begin()[0])->stripInBoundsOffsets());
+                        auto allocas = FindAllocaBases((CI->arg_begin()[0])->stripInBoundsOffsets());
                         // We know that with the right optimizations we can forward a sret directly from an argument
                         // This hasn't been seen without adding IPO effects to julia functions but it's possible we need to handle that too
                         // If they are tracked.all we can just pass through but if they have a roots bundle it's possible we need to emit some copies ¯\_(ツ)_/¯
-                        if (!allocas_opt.has_value()) {
+                        if (allocas.size() == 0) {
                             llvm_dump(&F);
                             abort();
                         }
-                        auto allocas = allocas_opt.value();
                         for (AllocaInst *SRet : allocas) {
                             if (!(SRet->isStaticAlloca() && isa<PointerType>(ElT) && ElT->getPointerAddressSpace() == AddressSpace::Tracked)) {
                                 assert(!tracked.derived);
@@ -1267,12 +1266,7 @@ State LateLowerGCFrame::LocalScan(Function &F) {
                                 }
                                 else {
                                     Value *arg1 = (CI->arg_begin()[1])->stripInBoundsOffsets();
-                                    auto gc_allocas_opt = FindSretAllocas(arg1);
-                                    if (!gc_allocas_opt.has_value()) {
-                                        llvm_dump(&F);
-                                        abort();
-                                    }
-                                    auto gc_allocas = gc_allocas_opt.value();
+                                    auto gc_allocas = FindAllocaBases(arg1);
                                     if (gc_allocas.size() == 0) {
                                         llvm_dump(CI);
                                         errs() << "Expected one Alloca at least\n";
@@ -1455,7 +1449,8 @@ State LateLowerGCFrame::LocalScan(Function &F) {
                 }
             } else if (StoreInst *SI = dyn_cast<StoreInst>(&I)) {
                 NoteOperandUses(S, BBS, I);
-                MaybeTrackStore(S, SI);
+                if (MaybeTrackStore(S, SI))
+                    BBS.FirstSafepointAfterFirstDef = BBS.FirstSafepoint;
             } else if (isa<ReturnInst>(&I)) {
                 NoteOperandUses(S, BBS, I);
             } else if (auto *ASCI = dyn_cast<AddrSpaceCastInst>(&I)) {
@@ -1577,37 +1572,48 @@ SmallVector<Value*, 0> ExtractTrackedValues(Value *Src, Type *STy, bool isptr, I
 //    return Ptrs.size();
 //}
 
-void LateLowerGCFrame::MaybeTrackStore(State &S, StoreInst *I) {
+bool LateLowerGCFrame::MaybeTrackStore(State &S, StoreInst *I) {
     Value *PtrBase = I->getPointerOperand()->stripInBoundsOffsets();
     auto tracked = CountTrackedPointers(I->getValueOperand()->getType());
     if (!tracked.count)
-        return; // nothing to track is being stored
-    if (AllocaInst *AI = dyn_cast<AllocaInst>(PtrBase)) {
+        return false; // nothing to track is being stored
+    // Find all alloca bases, looking through selects and phis.
+    // LLVM's SROA/InstCombine can merge conditional alloca stores into a
+    // select/phi over alloca pointers (see #60985).
+    auto Allocas = FindAllocaBases(PtrBase);
+    if (Allocas.empty())
+        return false; // assume it is rooted--TODO: should we be more conservative?
+    bool needsTrackedStore = false;
+    bool Tracked = false;
+    for (AllocaInst *AI : Allocas) {
         Type *STy = AI->getAllocatedType();
         if (!AI->isStaticAlloca() || (isa<PointerType>(STy) && STy->getPointerAddressSpace() == AddressSpace::Tracked) || S.ArrayAllocas.count(AI))
-            return; // already numbered this
-        auto tracked = CountTrackedPointers(STy);
-        if (tracked.count) {
-            assert(!tracked.derived);
-            if (tracked.all) {
+            continue; // already numbered this
+        auto allocaTracked = CountTrackedPointers(STy);
+        if (allocaTracked.count) {
+            assert(!allocaTracked.derived);
+            if (allocaTracked.all) {
                 // track the Alloca directly
-                S.ArrayAllocas[AI] = tracked.count * cast<ConstantInt>(AI->getArraySize())->getZExtValue();
-                return;
+                S.ArrayAllocas[AI] = allocaTracked.count * cast<ConstantInt>(AI->getArraySize())->getZExtValue();
+                Tracked = true;
+                continue;
             }
         }
+        needsTrackedStore = true;
     }
-    else {
-        return; // assume it is rooted--TODO: should we be more conservative?
+    if (needsTrackedStore) {
+        // track the Store with a Shadow
+        //auto &Shadow = S.ShadowAllocas[AI];
+        //if (!Shadow)
+        //    Shadow = new AllocaInst(ArrayType::get(T_prjlvalue, tracked.count), 0, "", MI);
+        //AI = Shadow;
+        //Value *Src = I->getValueOperand();
+        //unsigned count = TrackWithShadow(Src, Src->getType(), false, AI, MI, TODO which slots are we actually clobbering?);
+        //assert(count == tracked.count); (void)count;
+        S.TrackedStores.push_back(std::make_pair(I, tracked.count));
+        Tracked = true;
     }
-    // track the Store with a Shadow
-    //auto &Shadow = S.ShadowAllocas[AI];
-    //if (!Shadow)
-    //    Shadow = new AllocaInst(ArrayType::get(T_prjlvalue, tracked.count), 0, "", MI);
-    //AI = Shadow;
-    //Value *Src = I->getValueOperand();
-    //unsigned count = TrackWithShadow(Src, Src->getType(), false, AI, MI, TODO which slots are we actually clobbering?);
-    //assert(count == tracked.count); (void)count;
-    S.TrackedStores.push_back(std::make_pair(I, tracked.count));
+    return Tracked;
 }
 
 /*

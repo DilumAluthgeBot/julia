@@ -10,7 +10,11 @@ const Bottom = Union{}
 size(a::Array) = getfield(a, :size)
 length(t::AbstractArray) = (@inline; prod(size(t)))
 size(a::GenericMemory) = (getfield(a, :length),)
+throw_boundserror(A) = (@noinline; throw(BoundsError(A, ())))
 throw_boundserror(A, I) = (@noinline; throw(BoundsError(A, I)))
+throw_boundserror(A, i1, i2, I...) = (@noinline; throw(BoundsError(A, (i1, i2, I...))))
+_throw_boundserror_indices(A) = (@noinline; throw(BoundsError(A, ())))
+_throw_boundserror_indices(A, i1, I...) = (@noinline; throw(BoundsError(A, (i1, I...))))
 
 # multidimensional getindex will be defined later on
 
@@ -383,6 +387,7 @@ end
 function checkbounds(A::Union{Array, GenericMemory}, i::Int)
     @inline
     checkbounds(Bool, A, i) || throw_boundserror(A, (i,))
+    nothing
 end
 
 default_access_order(::GenericMemory{:not_atomic}) = :not_atomic
